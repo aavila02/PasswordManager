@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import hashlib
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -63,13 +64,44 @@ def get_salt():
             file.write(salt)
         return salt
 
+# Hash the master password using SHA-256
+def hash_master_password(master_password: str) -> bytes:
+    return hashlib.sha256(master_password.encode()).digest()
+
+# Verify master password by comparing with stored hash
+def verify_master_password(master_password: str) -> bool:
+    hashed_password = hash_master_password(master_password)
+    if os.path.exists("master_hash.bin"):
+        with open("master_hash.bin", "rb") as f:
+            stored_hash = f.read()
+        return hashed_password == stored_hash
+    else:
+        # If no hash exists, store the hash on first run
+        with open("master_hash.bin", "wb") as f:
+            f.write(hashed_password)
+        return True
+
+# Prompt for a secure master password with a minimum length requirement
+def get_secure_master_password() -> str:
+    while True:
+        master_password = getpass.getpass('Enter your master password (min 8 characters): ')
+        if len(master_password) >= 8:
+            return master_password
+        else:
+            print("Password must be at least 8 characters long.")
+
 # Main Password Manager
 def password_manager():
     # Get or generate a constant salt
     salt = get_salt()
 
-    # Ask user for a master password to encrypt/decrypt their passwords
-    master_password = getpass.getpass('Enter your master password: ')
+    # Prompt for and verify the master password
+    master_password = get_secure_master_password()
+    if not verify_master_password(master_password):
+        print("Incorrect master password. Access denied.")
+        return  # Exit if the master password doesn't match the stored hash
+
+    # Generate the encryption key from the master password and salt
     key = generate_key(master_password, salt)
     
     filename = "passwords.json"
