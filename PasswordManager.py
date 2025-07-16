@@ -9,6 +9,7 @@ import secrets
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
+
 # --- Core Functions ---
 def generate_key(password: str, salt: bytes) -> bytes:
     kdf = Scrypt(
