@@ -854,6 +854,35 @@ class ModernPasswordManager:
             if self.root:
                 self.root.quit()
 
+# ---- Lightweight CLI for password strength (non-GUI) ----
+def _strength_score(pw: str) -> int:
+    """Very simple heuristic: 0–4 score."""
+    import re
+    score = 0
+    if len(pw) >= 12: score += 1
+    if re.search(r"[A-Z]", pw): score += 1
+    if re.search(r"[a-z]", pw): score += 1
+    if re.search(r"\d", pw): score += 1
+    if re.search(r"[^\w\s]", pw): score += 1
+    return min(score, 4)
+
+def _strength_label(score: int) -> str:
+    return ["very weak","weak","okay","strong","very strong"][score]
+
+if __name__ == "__main__":
+    try:
+        import argparse
+        parser = argparse.ArgumentParser(description="Password Manager utilities")
+        parser.add_argument("--check-strength", metavar="PASSWORD", help="Print strength of a password and exit")
+        args, _ = parser.parse_known_args()
+        if args.check_strength:
+            s = _strength_score(args.check_strength)
+            print(_strength_label(s))
+            raise SystemExit(0)
+    except Exception:
+        # Fall through to your existing GUI startup if present
+        pass
+
 if __name__ == "__main__":
     # Check if pyperclip is available, install if needed
     try:
