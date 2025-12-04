@@ -4,14 +4,12 @@ import base64
 import hashlib
 import time
 import re
-import threading
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import secrets
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
-from threading import Timer
+from tkinter import messagebox, simpledialog, ttk, filedialog
 import pyperclip
 
 class ModernPasswordManager:
@@ -25,6 +23,7 @@ class ModernPasswordManager:
         self.lockout_duration = 300  # 5 minutes lockout
         self.last_lockout_time = 0
         self.last_activity = time.time()
+        # IDs returned by Tkinter's after() for safe, main-thread timers
         self.session_timer = None
         self.is_locked = False
         self.root = None
@@ -40,6 +39,46 @@ class ModernPasswordManager:
             self.key = os.urandom(len(self.key))
             self.key = None
         self.passwords.clear()
+
+    # --- Secure storage helpers ---
+    def get_data_dir(self) -> str:
+        """
+        Return the directory used to store vault data.
+
+        For simplicity, this is the same folder as the main script so that
+        all vault files live alongside PasswordManager.py.
+        """
+        # Directory where this file lives
+        data_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            os.makedirs(data_dir, mode=0o700, exist_ok=True)
+            # Best-effort to tighten permissions; ignore on platforms that don't support it
+            try:
+                os.chmod(data_dir, 0o700)
+            except Exception:
+                pass
+        except Exception:
+            # Fallback to current directory if creation fails
+            data_dir = "."
+        return data_dir
+
+    def _secure_write_bytes(self, path: str, data: bytes) -> None:
+        """Write bytes to a file and try to enforce 0600 permissions."""
+        with open(path, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
+    def _secure_write_text(self, path: str, data: str) -> None:
+        """Write text to a file and try to enforce 0600 permissions."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
         
     def is_account_locked(self):
         """Check if account is currently locked out"""
@@ -111,11 +150,19 @@ class ModernPasswordManager:
     def update_activity(self):
         """Update last activity timestamp and reset session timer"""
         self.last_activity = time.time()
-        if self.session_timer:
-            self.session_timer.cancel()
-        self.session_timer = Timer(self.session_timeout, self.lock_session)
-        self.session_timer.start()
-        self.update_timer_display()
+        # Only schedule UI timers once the root window exists
+        if self.root:
+            # Cancel any existing scheduled lock
+            if self.session_timer is not None:
+                try:
+                    self.root.after_cancel(self.session_timer)
+                except Exception:
+                    pass
+            # Schedule lock on inactivity using Tkinter's main thread
+            self.session_timer = self.root.after(
+                int(self.session_timeout * 1000), self.lock_session
+            )
+            self.update_timer_display()
     
     def update_timer_display(self):
         """Update the session timer display"""
@@ -178,11 +225,14 @@ class ModernPasswordManager:
             self.update_status("Copied to clipboard!")
             
             if auto_clear:
-                # Clear clipboard after 30 seconds
-                if self.clipboard_timer:
-                    self.clipboard_timer.cancel()
-                self.clipboard_timer = Timer(30, self.clear_clipboard)
-                self.clipboard_timer.start()
+                # Clear clipboard after 30 seconds, scheduled on the Tkinter main thread
+                if self.root:
+                    if self.clipboard_timer is not None:
+                        try:
+                            self.root.after_cancel(self.clipboard_timer)
+                        except Exception:
+                            pass
+                    self.clipboard_timer = self.root.after(30_000, self.clear_clipboard)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to copy to clipboard: {str(e)}")
     
@@ -236,22 +286,38 @@ class ModernPasswordManager:
     def save_passwords_to_file(self, filename: str, passwords: dict):
         """Save encrypted passwords to file"""
         try:
+            data_dir = self.get_data_dir()
+            target = os.path.join(data_dir, filename)
             # Add metadata
             data = {
                 "version": "2.0",
                 "created": time.time(),
                 "passwords": passwords
             }
-            with open(filename, 'w') as file:
-                json.dump(data, file, indent=2)
+            self._secure_write_text(target, json.dumps(data, indent=2))
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save passwords: {str(e)}")
 
     def load_passwords_from_file(self, filename: str) -> dict:
         """Load encrypted passwords from file"""
-        if os.path.exists(filename):
+        data_dir = self.get_data_dir()
+        target = os.path.join(data_dir, filename)
+
+        # Backwards compatibility: migrate legacy file from CWD if present
+        legacy = filename
+        if not os.path.exists(target) and os.path.exists(legacy):
             try:
-                with open(filename, 'r') as file:
+                with open(legacy, "r", encoding="utf-8") as file:
+                    raw = file.read()
+                os.remove(legacy)
+                self._secure_write_text(target, raw)
+            except Exception:
+                # If migration fails, fall back to reading legacy file directly
+                target = legacy
+
+        if os.path.exists(target):
+            try:
+                with open(target, 'r', encoding="utf-8") as file:
                     data = json.load(file)
                 # Handle both old and new format
                 if isinstance(data, dict) and "passwords" in data:
@@ -265,7 +331,21 @@ class ModernPasswordManager:
 
     def get_salt(self):
         """Get or generate salt for key derivation"""
-        salt_file = "salt.bin"
+        data_dir = self.get_data_dir()
+        salt_file = os.path.join(data_dir, "salt.bin")
+
+        # Migrate legacy salt if present
+        legacy = "salt.bin"
+        if not os.path.exists(salt_file) and os.path.exists(legacy):
+            try:
+                with open(legacy, "rb") as f:
+                    legacy_salt = f.read()
+                os.remove(legacy)
+                self._secure_write_bytes(salt_file, legacy_salt)
+                return legacy_salt
+            except Exception:
+                pass
+
         if os.path.exists(salt_file):
             try:
                 with open(salt_file, 'rb') as file:
@@ -273,30 +353,100 @@ class ModernPasswordManager:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to read salt: {str(e)}")
                 return None
-        else:
-            salt = os.urandom(16)
-            try:
-                with open(salt_file, 'wb') as file:
-                    file.write(salt)
-                return salt
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to create salt: {str(e)}")
-                return None
+
+        # Generate new salt
+        salt = os.urandom(16)
+        try:
+            self._secure_write_bytes(salt_file, salt)
+            return salt
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create salt: {str(e)}")
+            return None
 
     def hash_master_password(self, master_password: str) -> bytes:
         """Hash master password using SHA-256"""
         return hashlib.sha256(master_password.encode()).digest()
 
+    def _create_scrypt_master_record(self, master_password: str) -> dict:
+        """
+        Create a salted Scrypt-based record for the master password.
+
+        The record is JSON-serializable and includes parameters so we can
+        change work factors in the future without breaking verification.
+        """
+        salt = os.urandom(16)
+        params = {
+            "version": 2,
+            "kdf": "scrypt",
+            "n": 2**14,
+            "r": 8,
+            "p": 1,
+        }
+        kdf = Scrypt(
+            salt=salt,
+            length=32,
+            n=params["n"],
+            r=params["r"],
+            p=params["p"],
+            backend=default_backend(),
+        )
+        derived = kdf.derive(master_password.encode())
+        params["salt"] = base64.b64encode(salt).decode()
+        params["hash"] = base64.b64encode(derived).decode()
+        return params
+
+    def _verify_scrypt_master_record(self, master_password: str, record: dict) -> bool:
+        """Verify a master password against a Scrypt-based record."""
+        try:
+            if record.get("kdf") != "scrypt":
+                return False
+            n = record.get("n", 2**14)
+            r = record.get("r", 8)
+            p = record.get("p", 1)
+            salt = base64.b64decode(record["salt"])
+            stored_hash = base64.b64decode(record["hash"])
+            kdf = Scrypt(
+                salt=salt,
+                length=len(stored_hash),
+                n=n,
+                r=r,
+                p=p,
+                backend=default_backend(),
+            )
+            kdf.verify(master_password.encode(), stored_hash)
+            return True
+        except Exception:
+            return False
+
     def verify_master_password(self, master_password: str) -> bool:
         """Verify master password against stored hash"""
-        hashed_password = self.hash_master_password(master_password)
-        hash_file = "master_hash.bin"
+        data_dir = self.get_data_dir()
+        hash_file = os.path.join(data_dir, "master_hash.bin")
         
         if os.path.exists(hash_file):
             try:
                 with open(hash_file, "rb") as f:
-                    stored_hash = f.read()
-                return hashed_password == stored_hash
+                    raw = f.read()
+
+                # Prefer the newer, JSON-based Scrypt record format
+                try:
+                    record = json.loads(raw.decode())
+                    if self._verify_scrypt_master_record(master_password, record):
+                        return True
+                    return False
+                except Exception:
+                    # Legacy format: raw SHA-256 digest bytes
+                    stored_hash = raw
+                    if self.hash_master_password(master_password) == stored_hash:
+                        # On successful legacy verification, transparently upgrade
+                        try:
+                            new_record = self._create_scrypt_master_record(master_password)
+                            self._secure_write_text(hash_file, json.dumps(new_record))
+                        except Exception:
+                            # If upgrade fails, still allow login
+                            pass
+                        return True
+                    return False
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to verify password: {str(e)}")
                 return False
@@ -308,8 +458,8 @@ class ModernPasswordManager:
                 return False
             
             try:
-                with open(hash_file, "wb") as f:
-                    f.write(hashed_password)
+                record = self._create_scrypt_master_record(master_password)
+                self._secure_write_text(hash_file, json.dumps(record))
                 return True
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save password hash: {str(e)}")
@@ -582,33 +732,169 @@ class ModernPasswordManager:
             messagebox.showerror("Error", f"No password found for {site}.")
 
     def export_passwords(self):
-        """Export passwords to encrypted backup file"""
+        """Export passwords to an encrypted backup file protected by its own password"""
         if not self.check_session_status():
             return
         
         self.update_activity()
-        
+
         if not self.passwords:
             messagebox.showinfo("Export", "No passwords to export.")
             return
-        
-        # Simple export to JSON (for demo - in production, this would be more secure)
-        backup_data = {
+
+        # Ask user for a backup password
+        backup_password = simpledialog.askstring(
+            "Backup Password",
+            "Enter a password to protect the backup file:",
+            show="*",
+        )
+        if not backup_password:
+            return
+
+        confirm_password = simpledialog.askstring(
+            "Confirm Backup Password",
+            "Re-enter the backup password:",
+            show="*",
+        )
+        if backup_password != confirm_password:
+            messagebox.showerror("Mismatch", "Backup passwords do not match.")
+            return
+
+        # Prepare payload with metadata and stored ciphertexts
+        backup_payload = {
             "timestamp": time.time(),
             "version": "2.0",
             "count": len(self.passwords),
-            "passwords": self.passwords
+            "passwords": self.passwords,
         }
-        
-        filename = f"password_backup_{int(time.time())}.json"
+        plaintext = json.dumps(backup_payload).encode("utf-8")
+
+        # Derive a key from the backup password
+        salt = os.urandom(16)
+        kdf = Scrypt(
+            salt=salt,
+            length=32,
+            n=2**14,
+            r=8,
+            p=1,
+            backend=default_backend(),
+        )
+        backup_key = kdf.derive(backup_password.encode())
+
+        aesgcm = AESGCM(backup_key)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+
+        export_record = {
+            "version": 1,
+            "kdf": "scrypt",
+            "n": 2**14,
+            "r": 8,
+            "p": 1,
+            "salt": base64.b64encode(salt).decode(),
+            "nonce": base64.b64encode(nonce).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+
+        data_dir = self.get_data_dir()
+        filename = os.path.join(
+            data_dir, f"password_backup_{int(time.time())}.mpmbackup"
+        )
+
         try:
-            with open(filename, 'w') as f:
-                json.dump(backup_data, f, indent=2)
-            messagebox.showinfo("Export Complete", 
-                f"Passwords exported to {filename}\n\nKeep this file secure!")
+            self._secure_write_text(filename, json.dumps(export_record, indent=2))
+            messagebox.showinfo(
+                "Export Complete",
+                f"Encrypted backup created at:\n{filename}\n\n"
+                "Keep this file safe and remember the backup password.",
+            )
             self.update_status(f"Exported {len(self.passwords)} passwords")
         except Exception as e:
-            messagebox.showerror("Export Failed", f"Failed to export passwords: {str(e)}")
+            messagebox.showerror(
+                "Export Failed", f"Failed to export encrypted backup: {str(e)}"
+            )
+
+    def import_passwords_from_backup(self):
+        """Import passwords from an encrypted backup (.mpmbackup) file"""
+        if not self.check_session_status():
+            return
+
+        self.update_activity()
+
+        data_dir = self.get_data_dir()
+        filepath = filedialog.askopenfilename(
+            title="Select encrypted backup file",
+            initialdir=data_dir,
+            filetypes=[("Password Manager Backup", "*.mpmbackup"), ("All files", "*.*")],
+        )
+        if not filepath:
+            return
+
+        # Ask for backup password
+        backup_password = simpledialog.askstring(
+            "Backup Password",
+            "Enter the password used to protect this backup:",
+            show="*",
+        )
+        if not backup_password:
+            return
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+
+            salt = base64.b64decode(rec["salt"])
+            nonce = base64.b64decode(rec["nonce"])
+            ciphertext = base64.b64decode(rec["ciphertext"])
+
+            n = rec.get("n", 2**14)
+            r = rec.get("r", 8)
+            p = rec.get("p", 1)
+
+            kdf = Scrypt(
+                salt=salt,
+                length=32,
+                n=n,
+                r=r,
+                p=p,
+                backend=default_backend(),
+            )
+            backup_key = kdf.derive(backup_password.encode())
+
+            aesgcm = AESGCM(backup_key)
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            payload = json.loads(plaintext.decode("utf-8"))
+
+            if not isinstance(payload, dict) or "passwords" not in payload:
+                raise ValueError("Invalid backup format")
+
+            imported_pwds = payload["passwords"] or {}
+            if not isinstance(imported_pwds, dict):
+                raise ValueError("Invalid passwords section in backup")
+
+            # Merge into current passwords, overriding duplicates
+            existing_count = len(self.passwords)
+            imported_count = len(imported_pwds)
+
+            self.passwords.update(imported_pwds)
+            self.save_passwords_to_file("passwords.json", self.passwords)
+            self.refresh_password_list()
+            self.update_stats()
+
+            messagebox.showinfo(
+                "Import Complete",
+                f"Imported {imported_count} entries from backup.\n"
+                f"Vault now contains {len(self.passwords)} passwords.",
+            )
+            self.update_status(
+                f"Imported {imported_count} passwords from encrypted backup"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Import Failed",
+                "Failed to import backup. The password may be incorrect or the "
+                f"file may be corrupted.\n\nDetails: {str(e)}",
+            )
 
     def lock_manually(self):
         """Manually lock the session"""
@@ -670,8 +956,11 @@ class ModernPasswordManager:
         # Create the main window
         self.root = tk.Tk()
         self.root.title("Modern Password Manager")
-        self.root.geometry("800x600")
-        self.root.configure(bg="#f0f0f0")
+        self.root.geometry("900x600")
+        # Prevent resizing the window so small that controls become inaccessible
+        self.root.minsize(800, 550)
+        # Dark background for the root window
+        self.root.configure(bg="#020617")
         
         # Bind window events to update activity
         self.root.bind('<Button-1>', lambda e: self.update_activity())
@@ -687,143 +976,343 @@ class ModernPasswordManager:
         self.root.mainloop()
 
     def create_main_interface(self):
-        """Create the main user interface"""
-        # Title
-        title_frame = tk.Frame(self.root, bg="#2c3e50", height=50)
+        """Create the main user interface (dark theme with tabs)"""
+        # Dark theme palette
+        bg_root = "#020617"
+        bg_panel = "#020617"
+        bg_card = "#0f172a"
+        bg_card_alt = "#020617"
+        border_color = "#1f2937"
+        text_primary = "#e5e7eb"
+        text_muted = "#9ca3af"
+        accent_primary = "#2563eb"
+        accent_success = "#22c55e"
+        accent_warning = "#eab308"
+        accent_danger = "#ef4444"
+        accent_muted = "#4b5563"
+
+        # Title bar
+        title_frame = tk.Frame(self.root, bg="#020617", height=50)
         title_frame.pack(fill=tk.X)
         title_frame.pack_propagate(False)
-        
-        title_label = tk.Label(title_frame, text="Modern Password Manager", 
-                             font=("Arial", 16, "bold"), fg="white", bg="#2c3e50")
+
+        title_label = tk.Label(
+            title_frame,
+            text="Modern Password Manager",
+            font=("Arial", 16, "bold"),
+            fg=text_primary,
+            bg="#020617",
+        )
         title_label.pack(pady=12)
 
-        # Status and timer frame
-        status_frame = tk.Frame(self.root, bg="#34495e", height=35)
+        # Status and timer bar
+        status_frame = tk.Frame(self.root, bg="#030712", height=32)
         status_frame.pack(fill=tk.X)
         status_frame.pack_propagate(False)
-        
-        self.status_label = tk.Label(status_frame, text="Ready", 
-                                   font=("Arial", 9), fg="white", bg="#34495e")
-        self.status_label.pack(side=tk.LEFT, padx=10, pady=8)
-        
-        self.timer_label = tk.Label(status_frame, text="", 
-                                  font=("Arial", 9), fg="white", bg="#34495e")
-        self.timer_label.pack(side=tk.RIGHT, padx=10, pady=8)
 
-        # Main content area
-        main_frame = tk.Frame(self.root, bg="#f8f9fa")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        self.status_label = tk.Label(
+            status_frame,
+            text="Ready",
+            font=("Arial", 9),
+            fg=text_muted,
+            bg="#030712",
+        )
+        self.status_label.pack(side=tk.LEFT, padx=10, pady=6)
 
-        # Left panel - Password list and search
-        left_frame = tk.LabelFrame(main_frame, text="Password Vault", 
-                                 font=("Arial", 12, "bold"), bg="white", fg="#2c3e50",
-                                 relief=tk.GROOVE, bd=2)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.timer_label = tk.Label(
+            status_frame,
+            text="",
+            font=("Arial", 9),
+            fg=text_muted,
+            bg="#030712",
+        )
+        self.timer_label.pack(side=tk.RIGHT, padx=10, pady=6)
+
+        # Main content area with tabs
+        main_frame = tk.Frame(self.root, bg=bg_panel)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "TNotebook",
+            background=bg_panel,
+            borderwidth=0,
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=bg_card,
+            foreground=text_muted,
+            padding=(10, 6),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#111827")],
+            foreground=[("selected", text_primary)],
+        )
+
+        # Shared dark button style for actions and tools
+        style.configure(
+            "Accent.TButton",
+            background="#1f2937",
+            foreground=text_primary,
+            padding=(6, 4),
+            borderwidth=0,
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#374151"), ("pressed", "#111827")],
+            foreground=[("disabled", "#6b7280")],
+        )
+
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # ----- Vault tab -----
+        vault_tab = tk.Frame(notebook, bg=bg_panel)
+        notebook.add(vault_tab, text="Vault")
+
+        vault_tab.columnconfigure(0, weight=3, uniform="vault")
+        vault_tab.columnconfigure(1, weight=2, uniform="vault")
+        vault_tab.rowconfigure(0, weight=1)
+
+        # Left side: password vault
+        left_container = tk.Frame(vault_tab, bg=bg_panel)
+        left_container.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
+
+        left_frame = tk.LabelFrame(
+            left_container,
+            text="Password Vault",
+            font=("Arial", 12, "bold"),
+            bg=bg_card,
+            fg=text_primary,
+            bd=1,
+            relief=tk.GROOVE,
+        )
+        left_frame.pack(fill=tk.BOTH, expand=True)
 
         # Search section
-        search_frame = tk.Frame(left_frame, bg="white")
-        search_frame.pack(fill=tk.X, padx=15, pady=10)
-        
-        tk.Label(search_frame, text="Search passwords:", 
-                font=("Arial", 10, "bold"), bg="white", fg="#2c3e50").pack(anchor=tk.W)
-        
+        search_frame = tk.Frame(left_frame, bg=bg_card)
+        search_frame.pack(fill=tk.X, padx=12, pady=10)
+
+        tk.Label(
+            search_frame,
+            text="Search passwords:",
+            font=("Arial", 10, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W)
+
         self.search_var = tk.StringVar()
-        search_entry = tk.Entry(search_frame, textvariable=self.search_var, 
-                              font=("Arial", 10), width=40, bg="white", fg="black",
-                              relief=tk.SUNKEN, bd=1)
-        search_entry.pack(fill=tk.X, pady=(5, 0))
-        search_entry.bind('<KeyRelease>', lambda event: self.on_search_change())
+        search_entry = tk.Entry(
+            search_frame,
+            textvariable=self.search_var,
+            font=("Arial", 10),
+            bg=bg_card_alt,
+            fg=text_primary,
+            insertbackground=text_primary,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=border_color,
+        )
+        search_entry.pack(fill=tk.X, pady=(6, 0))
+        search_entry.bind("<KeyRelease>", lambda event: self.on_search_change())
 
         # Password list
-        list_frame = tk.Frame(left_frame, bg="white")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
-        
-        tk.Label(list_frame, text="Saved passwords (double-click to copy):", 
-                font=("Arial", 10, "bold"), bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(0, 5))
-        
-        # Listbox with scrollbar
-        list_container = tk.Frame(list_frame, bg="white")
+        list_frame = tk.Frame(left_frame, bg=bg_card)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
+
+        tk.Label(
+            list_frame,
+            text="Saved passwords (double-click to copy):",
+            font=("Arial", 10, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        list_container = tk.Frame(list_frame, bg=bg_card)
         list_container.pack(fill=tk.BOTH, expand=True)
-        
-        self.listbox = tk.Listbox(list_container, font=("Arial", 10), 
-                                 selectmode=tk.SINGLE, height=20,
-                                 bg="white", fg="black", 
-                                 selectbackground="#3498db", selectforeground="white",
-                                 relief=tk.SUNKEN, bd=1)
-        scrollbar_list = ttk.Scrollbar(list_container, orient="vertical", 
-                                     command=self.listbox.yview)
+
+        self.listbox = tk.Listbox(
+            list_container,
+            font=("Arial", 10),
+            selectmode=tk.SINGLE,
+            bg=bg_card_alt,
+            fg=text_primary,
+            selectbackground=accent_primary,
+            selectforeground="white",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=border_color,
+            activestyle="none",
+        )
+        scrollbar_list = ttk.Scrollbar(
+            list_container, orient="vertical", command=self.listbox.yview
+        )
         self.listbox.configure(yscrollcommand=scrollbar_list.set)
-        
+
         self.listbox.pack(side="left", fill="both", expand=True)
         scrollbar_list.pack(side="right", fill="y")
-        
-        self.listbox.bind('<Double-Button-1>', self.on_list_select)
+        self.listbox.bind("<Double-Button-1>", self.on_list_select)
 
-        # Right panel - Actions
-        right_frame = tk.LabelFrame(main_frame, text="Actions", 
-                                  font=("Arial", 12, "bold"), bg="white", fg="#2c3e50", 
-                                  width=280, relief=tk.GROOVE, bd=2)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y)
-        right_frame.pack_propagate(False)
+        # Right side: actions & stats (non-scrollable container)
+        right_container = tk.Frame(vault_tab, bg=bg_panel)
+        right_container.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
 
-        # Actions section
-        actions_frame = tk.Frame(right_frame, bg="white")
-        actions_frame.pack(fill=tk.X, padx=15, pady=15)
+        actions_frame = tk.LabelFrame(
+            right_container,
+            text="Actions",
+            font=("Arial", 12, "bold"),
+            bg=bg_card,
+            fg=text_primary,
+            bd=1,
+            relief=tk.GROOVE,
+        )
+        actions_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Create styled buttons with better contrast
-        def create_button(parent, text, command, bg_color="#3498db", text_color="white"):
-            btn = tk.Button(parent, text=text, command=command,
-                          font=("Arial", 10, "bold"), width=26, height=2,
-                          bg=bg_color, fg=text_color, relief=tk.RAISED, bd=2,
-                          cursor="hand2", activebackground="#2980b9", 
-                          activeforeground="white")
-            return btn
+        def create_button(parent, text, command):
+            return ttk.Button(
+                parent,
+                text=text,
+                command=command,
+                style="Accent.TButton",
+            )
 
-        # Primary actions
-        tk.Label(actions_frame, text="Password Operations:", 
-                font=("Arial", 11, "bold"), bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(0, 8))
+        inner = tk.Frame(actions_frame, bg=bg_card)
+        inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
 
-        add_btn = create_button(actions_frame, "Add New Password", self.add_password, "#3498db")
-        add_btn.pack(pady=3, fill=tk.X)
+        # Password operations
+        tk.Label(
+            inner,
+            text="Password Operations",
+            font=("Arial", 11, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W, pady=(0, 6))
 
-        retrieve_btn = create_button(actions_frame, "Retrieve Password", self.retrieve_password, "#27ae60")
-        retrieve_btn.pack(pady=3, fill=tk.X)
+        create_button(inner, "Add New Password", self.add_password).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Retrieve Password", self.retrieve_password).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Generate Strong Password", self.generate_password).pack(
+            fill=tk.X, pady=3
+        )
 
-        generate_btn = create_button(actions_frame, "Generate Strong Password", self.generate_password, "#9b59b6")
-        generate_btn.pack(pady=3, fill=tk.X)
+        # Management
+        tk.Label(
+            inner,
+            text="Management",
+            font=("Arial", 11, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W, pady=(16, 6))
 
-        # Management actions
-        tk.Label(actions_frame, text="Management:", 
-                font=("Arial", 11, "bold"), bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(20, 8))
+        create_button(inner, "View All Passwords", self.view_saved_websites).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Delete Password", self.delete_password).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Export Backup", self.export_passwords).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Import Backup", self.import_passwords_from_backup).pack(
+            fill=tk.X, pady=3
+        )
 
-        view_btn = create_button(actions_frame, "View All Passwords", self.view_saved_websites, "#34495e")
-        view_btn.pack(pady=3, fill=tk.X)
+        # Security
+        tk.Label(
+            inner,
+            text="Security",
+            font=("Arial", 11, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W, pady=(16, 6))
 
-        delete_btn = create_button(actions_frame, "Delete Password", self.delete_password, "#e74c3c")
-        delete_btn.pack(pady=3, fill=tk.X)
+        create_button(inner, "Lock Session", self.lock_manually).pack(
+            fill=tk.X, pady=3
+        )
+        create_button(inner, "Exit Application", self.safe_exit).pack(
+            fill=tk.X, pady=3
+        )
 
-        export_btn = create_button(actions_frame, "Export Backup", self.export_passwords, "#f39c12")
-        export_btn.pack(pady=3, fill=tk.X)
+        # Stats at the bottom
+        stats_frame = tk.LabelFrame(
+            inner,
+            text="Statistics",
+            font=("Arial", 10, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+            bd=1,
+            relief=tk.GROOVE,
+        )
+        stats_frame.pack(fill=tk.X, pady=(16, 0))
 
-        # Security actions
-        tk.Label(actions_frame, text="Security:", 
-                font=("Arial", 11, "bold"), bg="white", fg="#2c3e50").pack(anchor=tk.W, pady=(20, 8))
+        self.stats_label = tk.Label(
+            stats_frame,
+            text="",
+            font=("Arial", 9),
+            bg=bg_card,
+            fg=text_primary,
+            justify=tk.LEFT,
+        )
+        self.stats_label.pack(pady=8, padx=8, anchor="w")
 
-        lock_btn = create_button(actions_frame, "Lock Session", self.lock_manually, "#95a5a6")
-        lock_btn.pack(pady=3, fill=tk.X)
+        # ----- Tools tab (simple utilities) -----
+        tools_tab = tk.Frame(notebook, bg=bg_panel)
+        notebook.add(tools_tab, text="Tools")
 
-        exit_btn = create_button(actions_frame, "Exit Application", self.safe_exit, "#7f8c8d")
-        exit_btn.pack(pady=3, fill=tk.X)
+        tools_tab.columnconfigure(0, weight=1)
+        tools_tab.rowconfigure(0, weight=1)
 
-        # Statistics section
-        stats_frame = tk.LabelFrame(right_frame, text="Statistics", 
-                                  font=("Arial", 10, "bold"), bg="white", fg="#2c3e50",
-                                  relief=tk.GROOVE, bd=1)
-        stats_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
-        
-        self.stats_label = tk.Label(stats_frame, text="", 
-                                  font=("Arial", 9), bg="white", fg="#2c3e50", justify=tk.LEFT)
-        self.stats_label.pack(pady=10, padx=10)
+        tools_frame = tk.LabelFrame(
+            tools_tab,
+            text="Utilities",
+            font=("Arial", 12, "bold"),
+            bg=bg_card,
+            fg=text_primary,
+            bd=1,
+            relief=tk.GROOVE,
+        )
+        tools_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+
+        tools_inner = tk.Frame(tools_frame, bg=bg_card)
+        tools_inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        tk.Label(
+            tools_inner,
+            text="Quick Password Tools",
+            font=("Arial", 11, "bold"),
+            bg=bg_card,
+            fg=text_muted,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        tk.Label(
+            tools_inner,
+            text="Use these helpers for generating and evaluating passwords.",
+            font=("Arial", 9),
+            bg=bg_card,
+            fg=text_muted,
+            wraplength=360,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 12))
+
+        create_button(
+            tools_inner, "Open Strong Password Generator", self.generate_password
+        ).pack(fill=tk.X, pady=4)
+
+        create_button(
+            tools_inner, "Export Encrypted Backup", self.export_passwords
+        ).pack(fill=tk.X, pady=4)
+
+        create_button(
+            tools_inner, "Import Encrypted Backup", self.import_passwords_from_backup
+        ).pack(fill=tk.X, pady=4)
 
         # Initialize display
         self.refresh_password_list()
@@ -846,10 +1335,17 @@ class ModernPasswordManager:
     def safe_exit(self):
         """Safely exit the application"""
         if messagebox.askyesno("Exit", "Are you sure you want to exit?\n\nAll sensitive data will be cleared from memory."):
-            if self.session_timer:
-                self.session_timer.cancel()
-            if self.clipboard_timer:
-                self.clipboard_timer.cancel()
+            if self.root:
+                if self.session_timer is not None:
+                    try:
+                        self.root.after_cancel(self.session_timer)
+                    except Exception:
+                        pass
+                if self.clipboard_timer is not None:
+                    try:
+                        self.root.after_cancel(self.clipboard_timer)
+                    except Exception:
+                        pass
             self.clear_sensitive_data()
             if self.root:
                 self.root.quit()
@@ -869,29 +1365,26 @@ def _strength_score(pw: str) -> int:
 def _strength_label(score: int) -> str:
     return ["very weak","weak","okay","strong","very strong"][score]
 
-if __name__ == "__main__":
-    try:
-        import argparse
-        parser = argparse.ArgumentParser(description="Password Manager utilities")
-        parser.add_argument("--check-strength", metavar="PASSWORD", help="Print strength of a password and exit")
-        args, _ = parser.parse_known_args()
-        if args.check_strength:
-            s = _strength_score(args.check_strength)
-            print(_strength_label(s))
-            raise SystemExit(0)
-    except Exception:
-        # Fall through to your existing GUI startup if present
-        pass
+def main() -> None:
+    """Entry point for both CLI utilities and the GUI application."""
+    import argparse
 
-if __name__ == "__main__":
-    # Check if pyperclip is available, install if needed
-    try:
-        import pyperclip
-    except ImportError:
-        print("Installing required dependency: pyperclip")
-        import subprocess
-        subprocess.check_call(["pip", "install", "pyperclip"])
-        import pyperclip
-    
+    parser = argparse.ArgumentParser(description="Password Manager utilities")
+    parser.add_argument(
+        "--check-strength",
+        metavar="PASSWORD",
+        help="Print strength of a password and exit",
+    )
+    args = parser.parse_args()
+
+    if args.check_strength:
+        score = _strength_score(args.check_strength)
+        print(_strength_label(score))
+        return
+
     app = ModernPasswordManager()
     app.run()
+
+
+if __name__ == "__main__":
+    main()
